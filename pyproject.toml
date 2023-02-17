@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "tess-buccaneer"
+version = "0.1.0"
+description = ""
+authors = ["Christina Hedges <christina.l.hedges@nasa.gov>"]
+readme = "README.md"
+packages = [{include = "tess_buccaneer", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.9,<3.12"
+lightkurve = "^2.3.0"
+astropy = "^5.2.1"
+matplotlib = "^3.7.0"
+scipy = "^1.10.0"
+pandas = "^1.5.3"
+pytest = "^7.2.1"
+
+
+[tool.poetry.group.dev.dependencies]
+ipython = "^8.10.0"
+jupyterlab = "^3.6.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
