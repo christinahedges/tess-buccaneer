@@ -53,7 +53,7 @@ def clean_tpf(tpf, pix_mask):
 class TPFModel(object):
     """Class to model a TPF"""
 
-    def __init__(self, tpf: lk.targetpixelfile.TargetPixelFile, polyorder=2):
+    def __init__(self, tpf: lk.targetpixelfile.TargetPixelFile, polyorder=1):
         self.include_ts_model = False
         m = np.percentile(tpf.flux.value, 10, axis=0)
         self.star_mask = ~larger_aper(sigma_clip(m, sigma=3).mask).ravel()
@@ -108,8 +108,8 @@ class TPFModel(object):
         # self.minframe = m - self.bkg0
         self.minframe = np.mean(self.meds, axis=0)
         self.use_pca_bkg = False
-        self._get_PCA_bkg_model()
-        # self.S = self.X.copy()
+#        self._get_PCA_bkg_model()
+        self.S = self.X.copy()
         self._get_sparse_arrays()
 
     @property
@@ -135,7 +135,7 @@ class TPFModel(object):
         self.V_model = self.X.dot(self.V_weights).T
 
         # Find only the components that are well modelled by a simple polynomial
-        S, self.comps = [], []
+        S, self.comps = [np.ones(np.product(self.shape[1:]))], []
         for vdx in range(self.V.shape[0]):
             chi1 = (self.V[vdx] - self.V_model[vdx][self.star_mask]) ** 2 / np.abs(
                 self.V[vdx] + self.V[vdx].min() + 1
@@ -213,12 +213,10 @@ class TPFModel(object):
                         g1.multiply(t).multiply(t),
                         g2.multiply(t).multiply(t),
                         g1.multiply(g2).multiply(t).multiply(t),
-                    ]
-                )
-                .tocsr()
+                    ])
                 .T
             )
-        sM2 = sparse.hstack(sM2, format="csr")
+        sM2 = sparse.hstack(sM2)
         self.sM = sparse.hstack([sM1, sM2]).tocsr()
         self.prior_mu = np.zeros(self.sM.shape[1])
         self.prior_sigma = np.ones(self.sM.shape[1]) * np.inf
@@ -253,7 +251,7 @@ class TPFModel(object):
             [self.prior_sigma, prior_sigma * np.ones(sM3.shape[1])]
         )
 
-        sigma_c_inv = sparse.csr_matrix(
+        sigma_c_inv = sparse.lil_matrix(
             (
                 len(self.sM1_idx) + len(self.sM2_idx) + len(self.sM3_idx),
                 len(self.sM1_idx) + len(self.sM2_idx) + len(self.sM3_idx),
@@ -268,7 +266,7 @@ class TPFModel(object):
         covi = np.linalg.inv(cov)
         #        covi = sparse.diags(1/(np.ones(sM3.shape[1]) * prior_sigma)**2, format='csr').toarray()
         sigma_c_inv[-covi.shape[0] :, -covi.shape[1] :] = covi
-        self.sigma_c_inv = sigma_c_inv
+        self.sigma_c_inv = sigma_c_inv.tocsr()
         self.sM = sparse.hstack([self.sM, sM3]).tocsr()
 
     def fit(self):
