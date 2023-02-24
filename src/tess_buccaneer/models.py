@@ -18,6 +18,7 @@ class BoxTransit:
     t0: u.Quantity
     duration: u.Quantity
     eclipse: bool = False
+    matrixtype: str = 'pixel'
 
     @property
     def kernel(self):
@@ -46,7 +47,12 @@ class BoxTransit:
             )
             return np.vstack([ts, ec]).T
 
-    def X(self, time: npt.ArrayLike, shape: tuple) -> sparse.csr_matrix:
+    def _X(self, time: npt.ArrayLike, shape: tuple) -> sparse.csr_matrix:
+        ts_model = self.model(time)
+        X = hstack(ts_model, np.product(shape))
+        return X.tocsr()
+
+    def _X_gaussian(self, time: npt.ArrayLike, shape: tuple) -> sparse.csr_matrix:
         ts_model = self.model(time)
         X = None
         kernel = self.kernel.ravel()
@@ -55,13 +61,27 @@ class BoxTransit:
             X = hstack(ts_model * amp, np.product(shape), X=X, offset=offset)
         return X.tocsr()
 
+    def X(self, time: npt.ArrayLike, shape: tuple) -> sparse.csr_matrix:
+        if self.matrixtype == 'pixel':
+            return self._X(time=time, shape=shape)
+        elif self.matrixtype == 'gaussian':
+            return self._X_gaussian(time=time, shape=shape)
+        else:
+            raise ValueError(f"No such type as {self.matrixtype}")
+
     def Xfootprint(self, shape: tuple) -> sparse.csr_matrix:
-        X = None
-        kernel = self.kernel.ravel()
-        locs = self.kernel_locs(shape).ravel()
-        for amp, offset in zip(kernel, locs):
-            X = hstack(np.atleast_2d(1) * amp, np.product(shape), X=X, offset=offset)
-        return X
+        if self.matrixtype == 'pixel':
+            X = hstack(np.atleast_2d(1), np.product(shape))
+            return X
+        elif self.matrixtype == 'gaussian':
+            X = None
+            kernel = self.kernel.ravel()
+            locs = self.kernel_locs(shape).ravel()
+            for amp, offset in zip(kernel, locs):
+                X = hstack(np.atleast_2d(1) * amp, np.product(shape), X=X, offset=offset)
+            return X
+        else:
+            raise ValueError(f"No such type as {self.matrixtype}")
 
     def estimate_covariance_matrix(self, prior_mu, prior_sigma, shape, nsamples=2000):
         X = self.Xfootprint(shape)

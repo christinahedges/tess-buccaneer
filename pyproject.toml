@@ -19,6 +19,7 @@ pytest = "^7.2.1"
 [tool.poetry.group.dev.dependencies]
 ipython = "^8.10.0"
 jupyterlab = "^3.6.1"
+line-profiler = "^4.0.2"
 
 [build-system]
 requires = ["poetry-core"]

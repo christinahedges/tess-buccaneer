@@ -47,7 +47,7 @@ def clean_tpf(tpf, pix_mask):
         ]
         bkg_mask.append(bad_bkg)
     bkg_mask = np.hstack(bkg_mask)
-    return tpf[~bkg_mask]
+    return tpf[~bkg_mask], ~bkg_mask
 
 
 class TPFModel(object):
@@ -57,9 +57,11 @@ class TPFModel(object):
         self.include_ts_model = False
         m = np.percentile(tpf.flux.value, 10, axis=0)
         self.star_mask = ~larger_aper(sigma_clip(m, sigma=3).mask).ravel()
-        self.tpf = clean_tpf(tpf, self.star_mask.reshape(tpf.shape[1:]))
+        self.tpf, self.tpf_mask = clean_tpf(tpf, self.star_mask.reshape(tpf.shape[1:]))
+        self.flux = self.tpf.flux.value
+        self.flux_err = self.tpf.flux_err.value
 
-        if (self.tpf.flux.value > 1e5).any():
+        if (self.flux > 1e5).any():
             raise ValueError("Contains saturated pixels, I cant cope with that yet.")
         self.R, self.C = np.mgrid[: self.tpf.shape[1], : self.tpf.shape[2]].astype(
             float
@@ -92,12 +94,12 @@ class TPFModel(object):
 
         self.meds, self.g1s, self.g2s = [], [], []
         for mask in self.time_masks:
-            m = np.median(self.tpf.flux.value[mask], axis=0)
+            m = np.median(self.flux[mask], axis=0)
 
             # The bkg zeropoint
             bkg0 = self.X.dot(
                 np.linalg.solve(
-                    self.X[self.star_mask].T.dot(self.X[self.star_mask]),
+                    self.X[self.star_mask].T.dot(self.X[self.star_mask]) + np.diag(1/(np.ones(self.X.shape[1]) * 1e4)**2),
                     self.X[self.star_mask].T.dot(m.ravel()[self.star_mask]),
                 )
             ).reshape(m.shape)
@@ -110,7 +112,16 @@ class TPFModel(object):
         self.use_pca_bkg = False
 #        self._get_PCA_bkg_model()
         self.S = self.X.copy()
-        self._get_sparse_arrays()
+        self.prior_mu = np.asarray([])
+        self.prior_sigma = np.asarray([])
+#        self._get_sparse_arrays()
+        self._get_bkg_model()
+        self._get_jitter_model()
+        self.sM = sparse.hstack([self.sM1, self.sM2]).tocsr()
+        self.sM1_idx = np.arange(self.sM1.shape[1])
+        self.sM2_idx = np.arange(self.sM1.shape[1], self.sM1.shape[1] + self.sM2.shape[1])
+        self.sigma_c_inv = sparse.diags(1 / self.prior_sigma**2, format="csr")
+
 
     @property
     def shape(self):
@@ -119,7 +130,7 @@ class TPFModel(object):
     def _get_PCA_bkg_model(self):
         """This gets the components for the PCA bkg model"""
         self.use_pca_bkg = True
-        resids = self.tpf.flux.value - self.minframe
+        resids = self.flux - self.minframe
 
         # Get the PCA components for the background data, up to 10
         self.U, self.s, self.V = pca(
@@ -155,8 +166,52 @@ class TPFModel(object):
         )
         self.S = np.asarray(S).T
 
-    def _get_sparse_arrays(self):
-        resids = self.tpf.flux.value - self.minframe
+    def _get_bkg_model(self):
+        resids = self.flux - self.minframe
+        # model = self.S.dot(
+        #     np.linalg.solve(
+        #         self.S[self.star_mask].T.dot(self.S[self.star_mask]),
+        #         self.S[self.star_mask].T.dot(
+        #             resids[:, self.star_mask.reshape(self.shape[1:])].T
+        #         ),
+        #     )
+        # ).T
+        # model = model.reshape(self.shape)
+        # medframe = np.median(self.flux - model, axis=0)
+        # gframe = np.gradient(medframe)
+        mask3d = (
+            self.star_mask.reshape(self.shape[1:])[None, :, :]
+            * np.ones(self.shape, bool)
+        ).ravel()
+
+        self.sM1 = vstack(self.S, self.shape[0]).tocsr()
+        self.prior_mu = np.hstack([self.prior_mu, np.zeros(self.sM1.shape[1])])
+        self.prior_sigma = np.hstack([self.prior_sigma, np.ones(self.sM1.shape[1]) * 1e4])
+        self.sm1_weights = np.linalg.solve(
+            self.sM1[mask3d].T.dot(self.sM1[mask3d]).toarray() + np.diag(1/(np.ones(self.sM1.shape[1]) * 1e4)**2),
+            self.sM1[mask3d].T.dot(self.flux.ravel()[mask3d]),
+        )
+        self.prior_mu[: self.sM1.shape[1]] = self.sm1_weights
+        self.prior_sigma[: self.sM1.shape[1]] = 10
+        self.bkg_model = self.sM1.dot(self.sm1_weights).reshape(self.shape)
+
+    def _get_jitter_model(self, ncomps=2, polyorder=2):
+        resids = self.flux - self.bkg_model
+        self.jitter_comps, s, V = pca(resids[:, ~self.star_mask.reshape(self.shape[1:])], ncomps, n_iter=5)
+        U = np.hstack([self.jitter_comps, np.vstack([self.t**idx for idx in range(polyorder+1)]).T])
+        self.sM2 = hstack(U, np.product(self.shape[1:])).tocsr()
+        self.prior_mu = np.hstack([self.prior_mu, np.zeros(self.sM2.shape[1])])
+        self.prior_sigma = np.hstack([self.prior_sigma, np.ones(self.sM2.shape[1]) * np.inf])
+        self.sm2_weights = np.linalg.solve(
+            self.sM2.T.dot(self.sM2).toarray(),
+            self.sM2.T.dot(resids.ravel()),
+        )
+        self.prior_mu[: self.sM2.shape[1]] = self.sm2_weights
+        self.prior_sigma[: self.sM2.shape[1]] = 10
+        self.jitter_model = self.sM2.dot(self.sm2_weights).reshape(self.shape)
+
+    def _old(self):
+        resids = self.flux - self.minframe
         model = self.S.dot(
             np.linalg.solve(
                 self.S[self.star_mask].T.dot(self.S[self.star_mask]),
@@ -166,7 +221,7 @@ class TPFModel(object):
             )
         ).T
         model = model.reshape(self.shape)
-        # medframe = np.median(self.tpf.flux.value - model, axis=0)
+        # medframe = np.median(self.flux - model, axis=0)
         # gframe = np.gradient(medframe)
         mask3d = (
             self.star_mask.reshape(self.shape[1:])[None, :, :]
@@ -222,12 +277,12 @@ class TPFModel(object):
         self.prior_sigma = np.ones(self.sM.shape[1]) * np.inf
         sm1_weights = np.linalg.solve(
             sM1[mask3d].T.dot(sM1[mask3d]).toarray(),
-            sM1[mask3d].T.dot(self.tpf.flux.value.ravel()[mask3d]),
+            sM1[mask3d].T.dot(self.flux.ravel()[mask3d]),
         )
         self.prior_mu[: sM1.shape[1]] = sm1_weights
         self.prior_sigma[: sM1.shape[1]] = 10
         sm2_weights = np.linalg.solve(
-            self.sM.T.dot(self.sM).toarray(), self.sM.T.dot(self.tpf.flux.value.ravel())
+            self.sM.T.dot(self.sM).toarray(), self.sM.T.dot(self.flux.ravel())
         )
         self.prior_mu[-sM2.shape[1] :] = sm2_weights[-sM2.shape[1] :]
         self.prior_sigma[-sM2.shape[1] :] = 1
@@ -279,38 +334,38 @@ class TPFModel(object):
             self.sm_weights = np.linalg.solve(
                 sigma_w_inv,
                 self.sM[good_pixel_mask].T.dot(
-                    self.tpf.flux.value.ravel()[good_pixel_mask]
+                    self.flux.ravel()[good_pixel_mask]
                 )
                 + (self.prior_mu * self.sigma_c_inv.diagonal()),
             )
 
             smodel = self.sM.dot(self.sm_weights).reshape(self.shape)
-            resids = ((self.tpf.flux.value - smodel) / self.tpf.flux_err.value).ravel()
+            resids = ((self.flux - smodel) / self.tpf.flux_err.value).ravel()
             good_pixel_mask = ~sigma_clip(
                 resids, sigma=6, cenfunc=lambda x, axis: x
             ).mask
 
         return smodel
 
-    @property
-    def bkg_model(self):
-        if not hasattr(self, "sm_weights"):
-            raise ValueError("No weights exist, run `fit` method.")
-        return (
-            self.sM[:, self.sM1_idx]
-            .dot(self.sm_weights[self.sM1_idx])
-            .reshape(self.shape)
-        )
+    # @property
+    # def bkg_model(self):
+    #     if not hasattr(self, "sm_weights"):
+    #         raise ValueError("No weights exist, run `fit` method.")
+    #     return (
+    #         self.sM[:, self.sM1_idx]
+    #         .dot(self.sm_weights[self.sM1_idx])
+    #         .reshape(self.shape)
+    #     )
 
-    @property
-    def star_model(self):
-        if not hasattr(self, "sm_weights"):
-            raise ValueError("No weights exist, run `fit` method.")
-        return (
-            self.sM[:, self.sM2_idx]
-            .dot(self.sm_weights[self.sM2_idx])
-            .reshape(self.shape)
-        )
+    # @property
+    # def star_model(self):
+    #     if not hasattr(self, "sm_weights"):
+    #         raise ValueError("No weights exist, run `fit` method.")
+    #     return (
+    #         self.sM[:, self.sM2_idx]
+    #         .dot(self.sm_weights[self.sM2_idx])
+    #         .reshape(self.shape)
+    #     )
 
     def plot_PCA_model(self):
         if not self.use_pca_bkg:
@@ -372,10 +427,10 @@ class TPFModel(object):
 
     def plot_resids(self, frame, vmin=None, vmax=None, cmap="coolwarm"):
         fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-        resids1 = self.tpf.flux.value[frame] - np.median(self.tpf.flux.value, axis=0)
+        resids1 = self.flux[frame] - np.median(self.flux, axis=0)
         resids1 -= np.median(resids1[self.star_mask.reshape(self.shape[1:])], axis=0)
         resids2 = (
-            self.tpf.flux.value[frame] - self.bkg_model[frame] - self.star_model[frame]
+            self.flux[frame] - self.bkg_model[frame] - self.star_model[frame]
         )
         if vmin is None:
             vmin = np.min([np.percentile(resids1, 3), np.percentile(resids2, 3)])
@@ -395,7 +450,7 @@ class TPFModel(object):
             fig = plt.figure(figsize=(10, 3))
             ax = plt.subplot2grid((1, 4), (0, 3))
             ax.set(xlabel="Pixel Column", ylabel="Pixel Row", title="Time Series Power")
-            im = ax.imshow(L, vmin=-1, vmax=2)
+            im = ax.imshow(L, vmin=-0.5, vmax=0.5, cmap='coolwarm')
             cbar = plt.colorbar(im, ax=ax)
             cbar.set_label("Component Power [$e^-s^{-1}$]")
             ax = plt.subplot2grid((1, 4), (0, 0), colspan=3)
